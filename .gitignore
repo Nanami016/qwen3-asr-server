@@ -1,0 +1,53 @@
+# ─── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Virtual Environment ─────────────────────────────────────────────
+.venv/
+venv/
+ENV/
+
+# ─── IDE ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Logs ────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ─── Audio files (local test data) ──────────────────────────────────
+audio/
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.m4a
+*.webm
+
+# ─── Models (symlinks and downloaded models) ────────────────────────
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# ─── Server runtime ─────────────────────────────────────────────────
+.asr_server.pid
+server.json
+
+# ─── Environment ────────────────────────────────────────────────────
+.env
+.env.local
