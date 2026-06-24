@@ -2,7 +2,7 @@
 
 本地语音识别服务，使用 Qwen3-ASR 模型进行语音转文字，提供 OpenAI 兼容的 API 接口。
 
-本项目使用官方 `qwen-asr` Python 包提供等效服务。
+本项目使用 `mlx-audio` 在 Apple Silicon 上原生运行，无需 CUDA。
 
 ## 支持的模型
 
@@ -124,7 +124,7 @@ python asr_server.py --preload
 ## 故障排除
 
 ### 模型加载失败
-- 确保已安装 `qwen-asr`：`pip install -U qwen-asr`
+- 确保已安装 `mlx-audio`：`pip install mlx-audio`
 - 首次运行需要下载模型，请耐心等待
 - 检查 `models/` 目录下的符号链接是否正确
 
@@ -132,9 +132,9 @@ python asr_server.py --preload
 - 1.7B 模型需要约 4GB 内存
 - 如需更小内存，可考虑使用 0.6B 版本
 
-### macOS 兼容性
-- 当前版本在 macOS 上使用 CPU 运行（较慢）
-- 推荐使用 Linux + CUDA 获得最佳性能
+### Apple Silicon 加速
+- 本项目使用 MLX 框架，在 Apple Silicon 上原生加速
+- 无需 CUDA，M1/M2/M3/M4 芯片均可使用
 
 ### 查看日志
 ```bash

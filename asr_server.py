@@ -1,19 +1,18 @@
 """
 Qwen3-ASR 本地语音识别服务
-提供 OpenAI 兼容的 API 接口，替代 LM Studio 无法加载 qwen3_asr 模型的问题。
+提供 OpenAI 兼容的 API 接口，使用 MLX 加速（Apple Silicon 原生）。
 
 支持模型:
-    - Qwen3-ASR-1.7B (8-bit)
+    - Qwen3-ASR-1.7B (8-bit, MLX 量化)
 
 用法:
     python asr_server.py
-    python asr_server.py --port 1234
+    python asr_server.py --port 8000
     # 或使用 run.sh 后台运行
     ./run.sh start
 """
 
 import os
-import sys
 import json
 import base64
 import tempfile
@@ -26,7 +25,6 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.responses import JSONResponse
-import torch
 
 # ─── Logging (daily log files) ───────────────────────────────────────
 LOG_DIR = Path(__file__).parent / "logs"
@@ -53,32 +51,21 @@ logger = logging.getLogger("qwen3-asr-server")
 
 SERVER_CONFIG_PATH = Path(__file__).parent / "server.json"
 MODELS_DIR = Path(__file__).parent / "models"
-DEFAULT_MODEL = "Qwen3-ASR-1.7B"  # 默认模型
+DEFAULT_MODEL = "Qwen3-ASR-1.7B"
 
 # 支持的模型列表（本地目录名 -> HuggingFace 模型名）
 SUPPORTED_MODELS = {
-    "Qwen3-ASR-1.7B": "Qwen/Qwen3-ASR-1.7B",
+    "Qwen3-ASR-1.7B": "mlx-community/Qwen3-ASR-1.7B-8bit",
 }
 
 # ============================================================
 # FastAPI 应用
 # ============================================================
 
-app = FastAPI(title="Qwen3-ASR Server", version="2.0.0")
+app = FastAPI(title="Qwen3-ASR Server", version="3.0.0")
 
-# 全局模型实例缓存（模型名 -> 模型实例）
+# 全局模型实例缓存（模型名 -> (model, generate_fn)）
 _model_cache = {}
-
-
-def get_device():
-    """自动选择最佳计算设备"""
-    if torch.cuda.is_available():
-        return "cuda:0"
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        logger.info("检测到 Apple Silicon MPS，将使用 CPU 运行（qwen-asr 需要 CUDA）")
-        return "cpu"
-    else:
-        return "cpu"
 
 
 def resolve_model_path(model_name: str) -> str:
@@ -86,51 +73,54 @@ def resolve_model_path(model_name: str) -> str:
     local_path = MODELS_DIR / model_name
     if local_path.exists():
         return str(local_path)
-    # 回退到 HuggingFace 模型名
     return SUPPORTED_MODELS.get(model_name, model_name)
 
 
 def load_model(model_name: str = None):
-    """加载 Qwen3-ASR 模型（带缓存）"""
+    """加载 Qwen3-ASR 模型（MLX 加速，带缓存）"""
     global _model_cache
 
     if model_name is None:
         model_name = DEFAULT_MODEL
 
-    # 已缓存则直接返回
     if model_name in _model_cache:
         return _model_cache[model_name]
 
     model_path = resolve_model_path(model_name)
-    hf_name = SUPPORTED_MODELS.get(model_name, model_name)
     logger.info(f"正在加载模型: {model_name} ({model_path}) ...")
 
-    if not Path(model_path).exists():
-        logger.info("本地模型不存在，将从 HuggingFace 下载...")
-
     try:
-        from qwen_asr import Qwen3ASRModel
+        from mlx_audio.stt.utils import load_model as mlx_load_model
+        from mlx_audio.stt.generate import generate_transcription
 
-        device = get_device()
-        logger.info(f"计算设备: {device}")
-
-        model = Qwen3ASRModel.from_pretrained(
-            model_path,
-            dtype=torch.float32 if device == "cpu" else torch.bfloat16,
-            device_map=device,
-            max_inference_batch_size=4,
-            max_new_tokens=32768,
-        )
-        _model_cache[model_name] = model
-        logger.info(f"✅ 模型 {model_name} 加载成功!")
-        return model
+        model = mlx_load_model(model_path)
+        _model_cache[model_name] = (model, generate_transcription)
+        logger.info(f"✅ 模型 {model_name} 加载成功 (MLX 加速)!")
+        return (model, generate_transcription)
 
     except ImportError:
-        logger.error("❌ 未安装 qwen-asr 包，请运行: pip install -U qwen-asr")
+        logger.error("❌ 未安装 mlx-audio，请运行: pip install mlx-audio")
         raise
     except Exception as e:
         logger.error(f"❌ 模型加载失败: {e}")
         raise
+
+
+def transcribe_audio(model_name: str, audio_path: str) -> dict:
+    """使用 MLX 转录音频"""
+    model, generate_fn = load_model(model_name)
+    logger.info(f"正在转录: {audio_path}")
+
+    start_time = time.time()
+    result = generate_fn(model, audio=audio_path)
+    elapsed = time.time() - start_time
+
+    # 提取文本和语言
+    text = result.text if hasattr(result, 'text') else str(result)
+    language = result.language if hasattr(result, 'language') else "unknown"
+
+    logger.info(f"识别完成 [{language}] ({elapsed:.2f}s): {text[:100]}...")
+    return {"text": text, "language": language, "duration": elapsed}
 
 
 # ============================================================
@@ -161,10 +151,10 @@ async def list_models():
 async def chat_completions(request: Request):
     """
     兼容 OpenAI Chat Completions API 的语音识别端点。
-    
+
     接受格式:
     {
-        "model": "Qwen/Qwen3-ASR-0.6B",
+        "model": "Qwen3-ASR-1.7B",
         "messages": [
             {
                 "role": "user",
@@ -184,68 +174,43 @@ async def chat_completions(request: Request):
     if not messages:
         raise HTTPException(status_code=400, detail="缺少 messages 字段")
 
-    # 支持模型选择
     model_name = body.get("model", DEFAULT_MODEL)
-    # 兼容 HuggingFace 格式的模型名（如 Qwen/Qwen3-ASR-0.6B）
     if "/" in model_name:
         model_name = model_name.split("/")[-1]
 
-    # 从消息中提取音频 URL
     audio_url = None
-    language = None
     for msg in messages:
         if isinstance(msg.get("content"), list):
             for part in msg["content"]:
                 if part.get("type") == "audio_url":
                     audio_url = part["audio_url"].get("url")
-                elif part.get("type") == "text":
-                    # 可能包含语言提示
-                    pass
-        elif isinstance(msg.get("content"), str):
-            # 纯文本消息，跳过
-            pass
 
     if not audio_url:
-        raise HTTPException(status_code=400, detail="未找到音频 URL（需要 audio_url 类型的内容）")
+        raise HTTPException(status_code=400, detail="未找到音频 URL")
 
-    # 加载模型并转录
     try:
-        model = load_model(model_name)
-
-        # 处理音频 URL
         audio_input = audio_url
+        tmp_file = None
+
         if audio_url.startswith("file://"):
-            audio_input = audio_url[7:]  # 去掉 file:// 前缀
+            audio_input = audio_url[7:]
         elif audio_url.startswith("data:"):
-            # base64 编码的音频
-            # data:audio/wav;base64,xxxxx
             header, data = audio_url.split(",", 1)
             audio_bytes = base64.b64decode(data)
-            # 保存到临时文件
             suffix = ".wav"
             if "mp3" in header:
                 suffix = ".mp3"
             elif "ogg" in header:
                 suffix = ".ogg"
-            tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
-            tmp.write(audio_bytes)
-            tmp.close()
-            audio_input = tmp.name
+            tmp_file = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+            tmp_file.write(audio_bytes)
+            tmp_file.close()
+            audio_input = tmp_file.name
 
-        logger.info(f"正在转录音频: {audio_url[:80]}...")
-        results = model.transcribe(
-            audio=audio_input,
-            language=language,
-        )
+        result = transcribe_audio(model_name, audio_input)
 
-        # 清理临时文件
-        if audio_url.startswith("data:") and os.path.exists(audio_input):
-            os.unlink(audio_input)
-
-        text = results[0].text if results else ""
-        detected_lang = results[0].language if results else "unknown"
-
-        logger.info(f"识别完成 [{detected_lang}]: {text[:100]}...")
+        if tmp_file and os.path.exists(tmp_file.name):
+            os.unlink(tmp_file.name)
 
         return {
             "id": "asr-001",
@@ -257,20 +222,13 @@ async def chat_completions(request: Request):
                     "index": 0,
                     "message": {
                         "role": "assistant",
-                        "content": f"[{detected_lang}] {text}",
+                        "content": f"[{result['language']}] {result['text']}",
                     },
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-            "asr_result": {
-                "language": detected_lang,
-                "text": text,
-            },
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "asr_result": result,
         }
 
     except Exception as e:
@@ -282,51 +240,31 @@ async def chat_completions(request: Request):
 async def audio_transcriptions(
     file: UploadFile = File(...),
     model: str = DEFAULT_MODEL,
-    language: Optional[str] = None,
+    language: Optional[str] = None,  # API 兼容参数，暂未使用
 ):
     """
     兼容 OpenAI Audio Transcriptions API（Whisper 风格）。
 
     用法:
-        curl -X POST http://localhost:1234/v1/audio/transcriptions \
-            -F "file=@audio.wav" \
-            -F "model=Qwen3-ASR-0.6B"
+        curl -X POST http://localhost:8000/v1/audio/transcriptions \\
+            -F "file=@audio.wav" \\
+            -F "model=Qwen3-ASR-1.7B"
     """
     try:
-        # 解析模型名（兼容 HuggingFace 格式）
         model_name = model
         if "/" in model_name:
             model_name = model_name.split("/")[-1]
 
-        # 保存上传的音频文件
         suffix = Path(file.filename or "audio.wav").suffix or ".wav"
         tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
         content = await file.read()
         tmp.write(content)
         tmp.close()
 
-        # 加载模型并转录
-        asr_model = load_model(model_name)
-
-        logger.info(f"正在转录: {file.filename} ({len(content)} bytes)...")
-        results = asr_model.transcribe(
-            audio=tmp.name,
-            language=language,
-        )
-
-        # 清理临时文件
+        result = transcribe_audio(model_name, tmp.name)
         os.unlink(tmp.name)
 
-        text = results[0].text if results else ""
-        detected_lang = results[0].language if results else "unknown"
-
-        logger.info(f"识别完成 [{detected_lang}]: {text[:100]}...")
-
-        # 兼容 OpenAI Whisper API 返回格式
-        return {
-            "text": text,
-            "language": detected_lang,
-        }
+        return {"text": result["text"], "language": result["language"]}
 
     except Exception as e:
         logger.error(f"转录失败: {e}")
@@ -346,10 +284,7 @@ async def load_model_endpoint(request: Request):
         load_model(model_name)
         return {"status": "ok", "message": f"Model {model_name} loaded successfully"}
     except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "message": str(e)},
-        )
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 
 @app.get("/health")
@@ -357,11 +292,8 @@ async def health():
     """健康检查"""
     return {
         "status": "ok",
-        "models": {
-            name: name in _model_cache
-            for name in SUPPORTED_MODELS
-        },
-        "device": get_device(),
+        "engine": "mlx",
+        "models": {name: name in _model_cache for name in SUPPORTED_MODELS},
     }
 
 
@@ -372,7 +304,7 @@ async def health():
 def update_server_json(host: str, port: int, model_name: str = DEFAULT_MODEL):
     """更新 server.json 配置"""
     config = {
-        "software": "Qwen3-ASR Server (Python)",
+        "software": "Qwen3-ASR Server (MLX)",
         "host": f"http://127.0.0.1:{port}",
         "api_key": "sk-qwen3-asr-local",
         "model": SUPPORTED_MODELS.get(model_name, model_name),
@@ -384,7 +316,7 @@ def update_server_json(host: str, port: int, model_name: str = DEFAULT_MODEL):
 
 def main():
     global DEFAULT_MODEL
-    parser = argparse.ArgumentParser(description="Qwen3-ASR 本地语音识别服务")
+    parser = argparse.ArgumentParser(description="Qwen3-ASR 本地语音识别服务 (MLX)")
     parser.add_argument("--host", default="127.0.0.1", help="监听地址 (默认: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="监听端口 (默认: 8000)")
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"默认模型 (默认: {DEFAULT_MODEL})")
@@ -392,11 +324,8 @@ def main():
     args = parser.parse_args()
 
     DEFAULT_MODEL = args.model
-
-    # 更新 server.json
     update_server_json(args.host, args.port, args.model)
 
-    # 预加载模型
     if args.preload:
         try:
             load_model(args.model)
@@ -404,7 +333,7 @@ def main():
             logger.warning(f"预加载模型失败: {e}")
             logger.info("服务仍将启动，模型将在首次请求时加载")
 
-    logger.info(f"🚀 Qwen3-ASR Server 启动中...")
+    logger.info(f"🚀 Qwen3-ASR Server 启动中 (MLX 加速)...")
     logger.info(f"   地址: http://{args.host}:{args.port}")
     logger.info(f"   默认模型: {args.model}")
     logger.info(f"   可用模型: {', '.join(SUPPORTED_MODELS.keys())}")
