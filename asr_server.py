@@ -21,7 +21,9 @@ import logging
 import time
 import wave
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
+
+import numpy as np
 
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
@@ -207,6 +209,95 @@ def _compute_prefill_step_size(duration_sec: float) -> int:
     return step
 
 
+# ============================================================
+# 音频分块配置
+# ============================================================
+
+# 超过此时长(秒)的音频会被分块处理，避免小模型陷入重复循环
+CHUNK_THRESHOLD_SEC = 15 * 60  # 15 分钟
+# 每块时长(秒)
+CHUNK_DURATION_SEC = 10 * 60  # 10 分钟
+# 块间重叠(秒)，避免在句中截断导致丢失内容
+CHUNK_OVERLAP_SEC = 5
+
+
+def _split_audio_chunks(audio_path: str) -> List[dict]:
+    """将长音频按时长切分为多个块，返回临时文件路径列表。
+
+    每个元素: {"path": str, "start_sec": float, "end_sec": float}
+    调用方负责清理临时文件。
+    """
+    import soundfile as sf
+
+    info = sf.info(audio_path)
+    sr = info.samplerate
+    total_frames = info.frames
+    total_sec = info.duration
+
+    chunk_frames = int(CHUNK_DURATION_SEC * sr)
+    overlap_frames = int(CHUNK_OVERLAP_SEC * sr)
+    step_frames = chunk_frames - overlap_frames
+
+    # 读取整个音频（soundfile 对 WAV 很高效）
+    audio_data, _ = sf.read(audio_path, dtype="float32")
+
+    chunks = []
+    start_frame = 0
+    idx = 0
+    while start_frame < total_frames:
+        end_frame = min(start_frame + chunk_frames, total_frames)
+        chunk_audio = audio_data[start_frame:end_frame]
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        sf.write(tmp.name, chunk_audio, sr)
+        tmp.close()
+
+        chunks.append({
+            "path": tmp.name,
+            "start_sec": start_frame / sr,
+            "end_sec": end_frame / sr,
+            "index": idx,
+        })
+
+        logger.info(
+            f"  分块 {idx}: {start_frame/sr:.1f}s - {end_frame/sr:.1f}s "
+            f"({len(chunk_audio)/sr:.1f}s)"
+        )
+
+        start_frame += step_frames
+        idx += 1
+
+        # 最后一块已覆盖全部音频
+        if end_frame >= total_frames:
+            break
+
+    return chunks
+
+
+def _dedup_overlap(prev_text: str, curr_text: str, overlap_sec: float) -> str:
+    """去除相邻块重叠区域可能产生的重复文本。
+
+    策略：取前一块文本的尾部和当前块文本的头部，
+    找最长公共子串作为重叠，去除当前块中的重复部分。
+    """
+    if not prev_text or not curr_text:
+        return curr_text
+
+    # 重叠越长，比较的字符越多；按 overlap 估算可能重复的字符数
+    # 日语约 3-5 字符/秒，取保守值 5 字符/秒
+    max_dup_chars = int(overlap_sec * 5) + 20  # 额外 20 字符容错
+    tail = prev_text[-max_dup_chars:] if len(prev_text) > max_dup_chars else prev_text
+    head = curr_text[:max_dup_chars] if len(curr_text) > max_dup_chars else curr_text
+
+    # 从长到短尝试匹配尾部/头部
+    for length in range(min(len(tail), len(head)), 0, -1):
+        if tail[-length:] == head[:length]:
+            # 找到重叠，去掉 curr_text 开头的重复部分
+            return curr_text[length:]
+
+    return curr_text
+
+
 def transcribe_audio(model_name: str, audio_path: str) -> dict:
     """使用 MLX 转录音频"""
     model, generate_fn = load_model(model_name)
@@ -222,6 +313,58 @@ def transcribe_audio(model_name: str, audio_path: str) -> dict:
         )
 
     start_time = time.time()
+
+    # ── 长音频分块转录 ──────────────────────────────────────────
+    if duration_sec > CHUNK_THRESHOLD_SEC:
+        logger.info(
+            f"音频超过 {CHUNK_THRESHOLD_SEC/60:.0f} 分钟，启用分块转录 "
+            f"(每块 {CHUNK_DURATION_SEC/60:.0f} 分钟，重叠 {CHUNK_OVERLAP_SEC}s)"
+        )
+        chunks = _split_audio_chunks(audio_path)
+        texts = []
+        language = "unknown"
+
+        try:
+            for chunk in chunks:
+                logger.info(
+                    f"转录分块 {chunk['index']+1}/{len(chunks)}: "
+                    f"{chunk['start_sec']:.1f}s - {chunk['end_sec']:.1f}s"
+                )
+                chunk_prefill = _compute_prefill_step_size(
+                    chunk['end_sec'] - chunk['start_sec']
+                )
+                result = generate_fn(
+                    model, audio=chunk['path'], prefill_step_size=chunk_prefill
+                )
+                chunk_text = result.text if hasattr(result, 'text') else str(result)
+                if hasattr(result, 'language') and result.language != "unknown":
+                    language = result.language
+
+                # 去除与前一块重叠区域的重复文本
+                if texts:
+                    chunk_text = _dedup_overlap(
+                        texts[-1], chunk_text, CHUNK_OVERLAP_SEC
+                    )
+
+                texts.append(chunk_text)
+                logger.info(
+                    f"  分块 {chunk['index']+1} 完成: {chunk_text[:80]}..."
+                )
+        finally:
+            # 清理临时分块文件
+            for chunk in chunks:
+                if os.path.exists(chunk['path']):
+                    os.unlink(chunk['path'])
+
+        text = "".join(texts)
+        elapsed = time.time() - start_time
+        logger.info(
+            f"分块转录完成 [{language}] ({elapsed:.2f}s, {len(chunks)} 块): "
+            f"{text[:100]}..."
+        )
+        return {"text": text, "language": language, "duration": elapsed}
+
+    # ── 短音频：直接转录 ────────────────────────────────────────
     result = generate_fn(
         model, audio=audio_path, prefill_step_size=prefill_step_size
     )
