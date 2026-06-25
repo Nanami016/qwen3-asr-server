@@ -145,6 +145,30 @@ python asr_server.py --preload
 - 根据音频时长动态调整 prefill_step_size，长音频处理更高效
 - 详见 [MLX 性能优化方案](doc/mlx-performance-optimization.md)
 
+### 关于 mlx_audio 模型层优化
+
+本项目对 `mlx_audio` 的 Qwen3-ASR 模型代码有一项额外优化：消除 `_generate_single_chunk` 中对 `_preprocess_audio` 的重复调用（每次推理节省一次 feature extraction + encoder forward，约 15-25% 提速）。
+
+该改动在 `mlx_audio` 包内部（`.venv/lib/.../mlx_audio/stt/models/qwen3_asr/qwen3_asr.py`），不在本仓库中。**clone 本仓库后自动获得 wired limit / warmup / 动态 prefill 优化，但不包含此项。** 如需应用，手动修改 `mlx_audio` 包中的 `qwen3_asr.py`：
+
+```python
+# stream_generate() 新增两个参数：
+def stream_generate(self, audio, *, ..., precomputed_audio_features=None, precomputed_num_audio_tokens=None):
+    # 如果传入预计算特征，跳过重复编码
+    if precomputed_audio_features is not None:
+        audio_features = precomputed_audio_features
+        input_ids = self._build_prompt(precomputed_num_audio_tokens, language, system_prompt)
+    else:
+        # 原始路径 ...
+
+# _generate_single_chunk() 预计算一次后传入：
+input_features, feature_attention_mask, num_audio_tokens = self._preprocess_audio(audio_chunk)
+audio_features = self.get_audio_features(input_features, feature_attention_mask)
+# ... 传给 stream_generate(precomputed_audio_features=audio_features, ...)
+```
+
+详见 [MLX 性能优化方案 - P0](doc/mlx-performance-optimization.md#p0--消除重复计算-x)。
+
 ### 查看日志
 ```bash
 # 查看今天的日志
