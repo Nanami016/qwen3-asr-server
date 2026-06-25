@@ -20,6 +20,8 @@ qwen3-asr-server/
 ├── server.json            # 服务配置（自动生成）
 ├── README.md              # 本文件
 ├── .gitignore             # Git 忽略规则
+├── doc/                   # 文档
+│   └── mlx-performance-optimization.md  # MLX 性能优化方案
 ├── models/                # 模型文件（符号链接）
 │   └── Qwen3-ASR-1.7B -> ~/llm/mlx-community/Qwen3-ASR-1.7B-8bit/
 └── logs/                  # 服务日志（按日分割）
@@ -111,11 +113,14 @@ print(response.json()["text"])
 # 指定端口
 python asr_server.py --port 8080
 
-# 启动时预加载模型
+# 启动时预加载模型并执行 warmup（推荐，消除首次请求延迟）
 python asr_server.py --preload
 
 # 后台运行时指定端口（修改 run.sh 中的 PORT 变量）
 ```
+
+> `--preload` 会在启动时加载模型并运行一次 warmup 推理，预编译 Metal shader。
+> 不使用 `--preload` 时，warmup 会在首次请求时自动执行（首次请求会慢 2-5 秒）。
 
 ## 支持的语言
 
@@ -129,12 +134,16 @@ python asr_server.py --preload
 - 检查 `models/` 目录下的符号链接是否正确
 
 ### 内存不足
-- 1.7B 模型需要约 4GB 内存
+- 1.7B 模型（8-bit 量化）需要约 1.7GB 内存
+- 2 小时音频的 KV cache 约 5.1GB，总内存占用约 6.8GB
 - 如需更小内存，可考虑使用 0.6B 版本
 
 ### Apple Silicon 加速
 - 本项目使用 MLX 框架，在 Apple Silicon 上原生加速
-- 无需 CUDA，M1/M2/M3/M4 芯片均可使用
+- 无需 CUDA，M1/M2/M3/M4/M5 芯片均可使用
+- 启动时自动配置 wired limit 并执行 warmup 预编译 Metal shader
+- 根据音频时长动态调整 prefill_step_size，长音频处理更高效
+- 详见 [MLX 性能优化方案](doc/mlx-performance-optimization.md)
 
 ### 查看日志
 ```bash

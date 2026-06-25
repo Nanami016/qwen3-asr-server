@@ -114,6 +114,7 @@ info "  Log:  $LOG_FILE"
 nohup "$PYTHON" "$SCRIPT_DIR/asr_server.py" \
     --host "$HOST" \
     --port "$PORT" \
+    --preload \
     >> "$LOG_FILE" 2>&1 &
 
 SERVER_PID=$!

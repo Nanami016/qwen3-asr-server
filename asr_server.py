@@ -19,6 +19,7 @@ import tempfile
 import argparse
 import logging
 import time
+import wave
 from pathlib import Path
 from typing import Optional
 
@@ -76,6 +77,65 @@ def resolve_model_path(model_name: str) -> str:
     return SUPPORTED_MODELS.get(model_name, model_name)
 
 
+def _configure_mlx_memory():
+    """Configure MLX Metal memory for optimal GPU utilization."""
+    import mlx.core as mx
+
+    if not mx.metal.is_available():
+        return
+
+    info = mx.device_info()
+    max_rec = info["max_recommended_working_set_size"]
+    # Use 90% of recommended working set as wired limit to prevent
+    # Metal from evicting GPU buffers to system memory.
+    wired = int(max_rec * 0.9)
+    old = mx.set_wired_limit(wired)
+    logger.info(
+        f"MLX wired limit: {wired // 2**20} MB "
+        f"(was {old // 2**20} MB, max recommended {max_rec // 2**20} MB)"
+    )
+
+
+def _warmup_model(model, generate_fn):
+    """Run a dummy inference to pre-compile Metal shaders.
+
+    The first MLX inference triggers Metal shader compilation which adds
+    2-5s latency. This function runs a minimal inference at load time so
+    real requests don't pay that cost.
+    """
+    import tempfile
+    import numpy as np
+
+    tmp_path = None
+    try:
+        # Generate 0.5s of silence as warmup audio
+        sr = 16000
+        duration = 0.5
+        samples = int(sr * duration)
+        silence = np.zeros(samples, dtype=np.float32)
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        # Write minimal WAV header + data
+        import wave
+        with wave.open(tmp_path, "w") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes((silence * 32767).astype(np.int16).tobytes())
+
+        start = time.time()
+        result = generate_fn(model, audio=tmp_path)
+        elapsed = time.time() - start
+
+        logger.info(f"🔥 Warmup 完成 ({elapsed:.2f}s) — Metal shader 已预编译")
+    except Exception as e:
+        logger.warning(f"Warmup 失败（不影响正常使用）: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
 def load_model(model_name: str = None):
     """加载 Qwen3-ASR 模型（MLX 加速，带缓存）"""
     global _model_cache
@@ -93,9 +153,16 @@ def load_model(model_name: str = None):
         from mlx_audio.stt.utils import load_model as mlx_load_model
         from mlx_audio.stt.generate import generate_transcription
 
+        # Configure MLX memory for optimal GPU utilization
+        _configure_mlx_memory()
+
         model = mlx_load_model(model_path)
         _model_cache[model_name] = (model, generate_transcription)
         logger.info(f"✅ 模型 {model_name} 加载成功 (MLX 加速)!")
+
+        # Pre-compile Metal shaders so first real request is fast
+        _warmup_model(model, generate_transcription)
+
         return (model, generate_transcription)
 
     except ImportError:
@@ -106,13 +173,58 @@ def load_model(model_name: str = None):
         raise
 
 
+def _get_audio_duration(audio_path: str) -> float:
+    """Get audio duration in seconds without loading the full file."""
+    try:
+        import soundfile as sf
+        info = sf.info(audio_path)
+        return info.duration
+    except Exception:
+        return 0.0
+
+
+def _compute_prefill_step_size(duration_sec: float) -> int:
+    """Dynamically compute prefill_step_size based on audio duration.
+
+    Audio token rate: ~13 tokens/sec (100 frames/sec, chunk_size=100, ~13
+    tokens/chunk after Conv2d 3x stride-2).
+
+    Strategy: set step size to ~50% of total prompt tokens, clamped between
+    4096 and 16384. This reduces prefill iterations:
+      - 1min  (780 tok)  → 4096, 1 iter
+      - 5min  (3900 tok) → 4096, 1 iter
+      - 10min (7800 tok) → 4096, 2 iters
+      - 30min (23400)    → 11700, 2 iters
+      - 1h    (46800)    → 16384, 3 iters
+      - 2h    (93600)    → 16384, 6 iters
+
+    KV cache at 2h ≈ 5GB + 1.7GB weights = 6.7GB, well within 25.5GB limit.
+    """
+    tokens_per_sec = 13.0
+    estimated_tokens = int(duration_sec * tokens_per_sec)
+    # 50% of prompt tokens, clamped to [4096, 16384]
+    step = max(4096, min(estimated_tokens // 2, 16384))
+    return step
+
+
 def transcribe_audio(model_name: str, audio_path: str) -> dict:
     """使用 MLX 转录音频"""
     model, generate_fn = load_model(model_name)
     logger.info(f"正在转录: {audio_path}")
 
+    # Dynamically adjust prefill_step_size based on audio duration
+    duration_sec = _get_audio_duration(audio_path)
+    prefill_step_size = _compute_prefill_step_size(duration_sec)
+    if duration_sec > 0:
+        logger.info(
+            f"音频时长: {duration_sec:.1f}s, "
+            f"prefill_step_size: {prefill_step_size}"
+        )
+
     start_time = time.time()
-    result = generate_fn(model, audio=audio_path)
+    result = generate_fn(
+        model, audio=audio_path, prefill_step_size=prefill_step_size
+    )
     elapsed = time.time() - start_time
 
     # 提取文本和语言
