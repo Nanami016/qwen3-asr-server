@@ -51,3 +51,6 @@ server.json
 # ─── Environment ────────────────────────────────────────────────────
 .env
 .env.local
+
+# ─── Temporary files ─────────────────────────────────────────────────
+transcript.txt
