@@ -20,6 +20,8 @@ qwen3-asr-server/
 ├── server.json            # 服务配置（自动生成）
 ├── README.md              # 本文件
 ├── .gitignore             # Git 忽略规则
+├── doc/                   # 文档
+│   └── mlx-performance-optimization.md  # MLX 性能优化方案
 ├── models/                # 模型文件（符号链接）
 │   └── Qwen3-ASR-1.7B -> ~/llm/mlx-community/Qwen3-ASR-1.7B-8bit/
 └── logs/                  # 服务日志（按日分割）
@@ -111,11 +113,14 @@ print(response.json()["text"])
 # 指定端口
 python asr_server.py --port 8080
 
-# 启动时预加载模型
+# 启动时预加载模型并执行 warmup（推荐，消除首次请求延迟）
 python asr_server.py --preload
 
 # 后台运行时指定端口（修改 run.sh 中的 PORT 变量）
 ```
+
+> `--preload` 会在启动时加载模型并运行一次 warmup 推理，预编译 Metal shader。
+> 不使用 `--preload` 时，warmup 会在首次请求时自动执行（首次请求会慢 2-5 秒）。
 
 ## 支持的语言
 
@@ -129,12 +134,40 @@ python asr_server.py --preload
 - 检查 `models/` 目录下的符号链接是否正确
 
 ### 内存不足
-- 1.7B 模型需要约 4GB 内存
+- 1.7B 模型（8-bit 量化）需要约 1.7GB 内存
+- 2 小时音频的 KV cache 约 5.1GB，总内存占用约 6.8GB
 - 如需更小内存，可考虑使用 0.6B 版本
 
 ### Apple Silicon 加速
 - 本项目使用 MLX 框架，在 Apple Silicon 上原生加速
-- 无需 CUDA，M1/M2/M3/M4 芯片均可使用
+- 无需 CUDA，M1/M2/M3/M4/M5 芯片均可使用
+- 启动时自动配置 wired limit 并执行 warmup 预编译 Metal shader
+- 根据音频时长动态调整 prefill_step_size，长音频处理更高效
+- 详见 [MLX 性能优化方案](doc/mlx-performance-optimization.md)
+
+### 关于 mlx_audio 模型层优化
+
+本项目对 `mlx_audio` 的 Qwen3-ASR 模型代码有一项额外优化：消除 `_generate_single_chunk` 中对 `_preprocess_audio` 的重复调用（每次推理节省一次 feature extraction + encoder forward，约 15-25% 提速）。
+
+该改动在 `mlx_audio` 包内部（`.venv/lib/.../mlx_audio/stt/models/qwen3_asr/qwen3_asr.py`），不在本仓库中。**clone 本仓库后自动获得 wired limit / warmup / 动态 prefill 优化，但不包含此项。** 如需应用，手动修改 `mlx_audio` 包中的 `qwen3_asr.py`：
+
+```python
+# stream_generate() 新增两个参数：
+def stream_generate(self, audio, *, ..., precomputed_audio_features=None, precomputed_num_audio_tokens=None):
+    # 如果传入预计算特征，跳过重复编码
+    if precomputed_audio_features is not None:
+        audio_features = precomputed_audio_features
+        input_ids = self._build_prompt(precomputed_num_audio_tokens, language, system_prompt)
+    else:
+        # 原始路径 ...
+
+# _generate_single_chunk() 预计算一次后传入：
+input_features, feature_attention_mask, num_audio_tokens = self._preprocess_audio(audio_chunk)
+audio_features = self.get_audio_features(input_features, feature_attention_mask)
+# ... 传给 stream_generate(precomputed_audio_features=audio_features, ...)
+```
+
+详见 [MLX 性能优化方案 - P0](doc/mlx-performance-optimization.md#p0--消除重复计算-x)。
 
 ### 查看日志
 ```bash
